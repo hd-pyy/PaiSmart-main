@@ -304,6 +304,7 @@ public class ChatHandler {
         return conversationId;
     }
 
+    // 获取对话历史
     private List<Map<String, String>> getConversationHistory(String conversationId) {
         String key = "conversation:" + conversationId + ":messages";
         try {
