@@ -45,6 +45,7 @@ public class DeepSeekClient {
                              String context,
                              List<Map<String, String>> history,
                              Consumer<String> onChunk,
+                             Runnable onComplete,
                              Consumer<Throwable> onError) {
         
         Map<String, Object> request = buildRequest(userMessage, context, history);
@@ -55,9 +56,18 @@ public class DeepSeekClient {
                 .bodyValue(request)
                 .retrieve()
                 .bodyToFlux(String.class)
+                .doOnComplete(() -> {
+                    logger.debug("流式响应完成 onComplete触发");
+                    if (onComplete != null) {
+                        onComplete.run();
+                    }
+                })
                 .subscribe(
-                    chunk -> processChunk(chunk, onChunk),
-                    onError
+                    chunk -> processChunk(chunk, onChunk, onComplete),
+                    onError,
+                    () -> {
+                        // 已经在 doOnComplete 执行了 onComplete, 这里体应当空
+                    }
                 );
     }
     
@@ -135,11 +145,14 @@ public class DeepSeekClient {
         return messages;
     }
     
-    private void processChunk(String chunk, Consumer<String> onChunk) {
+    private void processChunk(String chunk, Consumer<String> onChunk, Runnable onComplete) {
         try {
             // 检查是否是结束标记
             if ("[DONE]".equals(chunk)) {
-                logger.debug("对话结束");
+                logger.debug("对话结束标记 [DONE] 接收");
+                if (onComplete != null) {
+                    onComplete.run();
+                }
                 return;
             }
             

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yizhaoqi.smartpai.client.DeepSeekClient;
 import com.yizhaoqi.smartpai.entity.SearchResult;
+import com.yizhaoqi.smartpai.service.ConversationService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
@@ -33,6 +34,7 @@ public class ChatHandler {
     private final RedisTemplate<String, String> redisTemplate;
     private final HybridSearchService searchService;
     private final DeepSeekClient deepSeekClient;
+    private final ConversationService conversationService;
     private final ObjectMapper objectMapper;
     
     // 用于存储每个会话的完整响应
@@ -44,10 +46,12 @@ public class ChatHandler {
 
     public ChatHandler(RedisTemplate<String, String> redisTemplate,
                       HybridSearchService searchService,
-                      DeepSeekClient deepSeekClient) {
+                      DeepSeekClient deepSeekClient,
+                      ConversationService conversationService) {
         this.redisTemplate = redisTemplate;
         this.searchService = searchService;
         this.deepSeekClient = deepSeekClient;
+        this.conversationService = conversationService;
         this.objectMapper = new ObjectMapper();
     }
 
@@ -77,7 +81,7 @@ public class ChatHandler {
             
             // 5. 调用 DeepSeek API 并处理流式响应
             logger.info("调用DeepSeek API生成回复");
-            deepSeekClient.streamResponse(userMessage, context, history, 
+            deepSeekClient.streamResponse(userMessage, context, history,
                 chunk -> {
                     // 累积响应内容
                     StringBuilder responseBuilder = responseBuilders.get(session.getId());
@@ -85,6 +89,21 @@ public class ChatHandler {
                         responseBuilder.append(chunk);
                     }
                     sendResponseChunk(session, chunk);
+                },
+                () -> {
+                    logger.info("DeepSeek流式响应完成回调，将持久化会话");
+                    StringBuilder responseBuilder = responseBuilders.get(session.getId());
+                    String completeResponse = responseBuilder != null ? responseBuilder.toString() : "";
+
+                    sendCompletionNotification(session);
+                    finalizeConversation(conversationId, userId, userMessage, completeResponse);
+
+                    responseBuilders.remove(session.getId());
+                    CompletableFuture<String> future = responseFutures.remove(session.getId());
+                    if (future != null && !future.isDone()) {
+                        future.complete(completeResponse);
+                    }
+                    logger.info("消息处理完成，用户ID: {}", userId);
                 },
                 error -> {
                     // 处理错误并完成future
@@ -96,116 +115,7 @@ public class ChatHandler {
                     responseBuilders.remove(session.getId());
                     responseFutures.remove(session.getId());
                 });
-            
-            // 6. 启动一个后台任务检查并标记响应完成
-            new Thread(() -> {
-                try {
-                    // 等待最多30秒，给API足够的响应时间
-                    Thread.sleep(3000); // 先等待3秒钟，让API有时间开始响应
-                    
-                    // 获取当前累积的响应内容
-                    StringBuilder responseBuilder = responseBuilders.get(session.getId());
-                    
-                    // 如果响应构建器存在并且已有内容，认为响应已完成
-                    if (responseBuilder != null) {
-                        // 记录最后2秒的响应变化，检测是否停止增长
-                        String lastResponse = responseBuilder.toString();
-                        int lastLength = lastResponse.length();
-                        
-                        Thread.sleep(2000); // 再等待2秒
-                        
-                        // 再次检查是否有新内容
-                        if (responseBuilder.length() == lastLength) {
-                            // 没有新内容，可以认为响应已完成
-                            responseFuture.complete(responseBuilder.toString());
-                            logger.info("DeepSeek响应已完成，长度: {}", responseBuilder.length());
-                            
-                            // 发送响应完成通知
-                            sendCompletionNotification(session);
-                            
-                            // 更新对话历史
-                            String completeResponse = responseBuilder.toString();
-                            updateConversationHistory(conversationId, userMessage, completeResponse);
-                            
-                            // 输出对话存储信息以便调试
-                            String redisKey = "user:" + userId + ":current_conversation";
-                            logger.info("对话存储信息 - Redis键: {}, 值: {}", redisKey, conversationId);
-                            
-                            // 清理会话响应构建器
-                            responseBuilders.remove(session.getId());
-                            responseFutures.remove(session.getId());
-                            logger.info("消息处理完成，用户ID: {}", userId);
-                        } else {
-                            // 仍有新内容，继续等待
-                            logger.debug("响应仍在继续，等待完成...");
-                            // 再等待最多25秒
-                            for (int i = 0; i < 5; i++) {
-                                Thread.sleep(5000);
-                                if (responseBuilder != null) {
-                                    lastLength = responseBuilder.length();
-                                    // 再次检查2秒内是否有新内容
-                                    Thread.sleep(2000);
-                                    if (responseBuilder.length() == lastLength) {
-                                        // 没有新内容，可以认为响应已完成
-                                        responseFuture.complete(responseBuilder.toString());
-                                        
-                                        // 发送响应完成通知
-                                        sendCompletionNotification(session);
-                                        
-                                        // 更新对话历史
-                                        String completeResponse = responseBuilder.toString();
-                                        updateConversationHistory(conversationId, userMessage, completeResponse);
-                                        
-                                        // 输出对话存储信息以便调试
-                                        String redisKey = "user:" + userId + ":current_conversation";
-                                        logger.info("对话存储信息 - Redis键: {}, 值: {}", redisKey, conversationId);
-                                        
-                                        // 清理会话响应构建器
-                                        responseBuilders.remove(session.getId());
-                                        responseFutures.remove(session.getId());
-                                        logger.info("消息处理完成，用户ID: {}", userId);
-                                        return;
-                                    }
-                                }
-                            }
-                            
-                            // 如果经过多次检查仍未完成，强制完成
-                            if (!responseFuture.isDone()) {
-                                responseFuture.complete(responseBuilder.toString());
-                                
-                                // 发送响应完成通知
-                                sendCompletionNotification(session);
-                                
-                                // 更新对话历史
-                                String completeResponse = responseBuilder.toString();
-                                updateConversationHistory(conversationId, userMessage, completeResponse);
-                                
-                                // 输出对话存储信息以便调试
-                                String redisKey = "user:" + userId + ":current_conversation";
-                                logger.info("对话存储信息 - Redis键: {}, 值: {}", redisKey, conversationId);
-                                
-                                // 清理会话响应构建器
-                                responseBuilders.remove(session.getId());
-                                responseFutures.remove(session.getId());
-                                logger.info("消息处理强制完成，用户ID: {}", userId);
-                            }
-                        }
-                    } else {
-                        logger.warn("响应构建器为空，可能出现了错误，会话ID: {}", session.getId());
-                        RuntimeException exception = new RuntimeException("响应构建器为空");
-                        responseFuture.completeExceptionally(exception);
-                        // 发送错误消息
-                        handleError(session, exception);
-                    }
-                } catch (Exception e) {
-                    logger.error("检查响应完成时出错: {}", e.getMessage(), e);
-                    responseFuture.completeExceptionally(e);
-                    
-                    // 清理会话响应构建器
-                    responseBuilders.remove(session.getId());
-                    responseFutures.remove(session.getId());
-                }
-            }).start();
+
             
         } catch (Exception e) {
             logger.error("处理消息错误: {}", e.getMessage(), e);
@@ -389,6 +299,24 @@ public class ChatHandler {
 
         } catch (JsonProcessingException e) {
             logger.error("序列化对话历史出错: {}, 会话ID: {}", e.getMessage(), conversationId, e);
+        }
+    }
+
+    private void finalizeConversation(String conversationId, String userId, String userMessage, String response) {
+        try {
+            updateConversationHistory(conversationId, userMessage, response);
+            persistConversation(userId, userMessage, response);
+        } catch (Exception e) {
+            logger.error("持久化对话失败: {}, 会话ID: {}", e.getMessage(), conversationId, e);
+        }
+    }
+
+    private void persistConversation(String userId, String userMessage, String response) {
+        try {
+            conversationService.recordConversation(userId, userMessage, response);
+            logger.debug("会话已持久化到数据库，用户ID: {}, 问题长度: {}, 回答长度: {}", userId, userMessage.length(), response.length());
+        } catch (Exception e) {
+            logger.error("数据库持久化失败，用户ID: {}, 错误: {}", userId, e.getMessage(), e);
         }
     }
 
