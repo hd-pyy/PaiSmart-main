@@ -49,6 +49,7 @@ public class DeepSeekClient {
                              Consumer<Throwable> onError) {
         
         Map<String, Object> request = buildRequest(userMessage, context, history);
+        java.util.concurrent.atomic.AtomicBoolean completed = new java.util.concurrent.atomic.AtomicBoolean(false);
         
         webClient.post()
                 .uri("/chat/completions")
@@ -57,16 +58,16 @@ public class DeepSeekClient {
                 .retrieve()
                 .bodyToFlux(String.class)
                 .doOnComplete(() -> {
-                    logger.debug("流式响应完成 onComplete触发");
-                    if (onComplete != null) {
+                    if (onComplete != null && completed.compareAndSet(false, true)) {
+                        logger.debug("流式响应完成 onComplete触发（doOnComplete）");
                         onComplete.run();
                     }
                 })
                 .subscribe(
-                    chunk -> processChunk(chunk, onChunk, onComplete),
+                    chunk -> processChunk(chunk, onChunk, onComplete, completed),
                     onError,
                     () -> {
-                        // 已经在 doOnComplete 执行了 onComplete, 这里体应当空
+                        // onComplete 已由 doOnComplete 唯一执行
                     }
                 );
     }

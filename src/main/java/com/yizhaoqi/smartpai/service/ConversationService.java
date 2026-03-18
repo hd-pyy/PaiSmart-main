@@ -69,6 +69,18 @@ public class ConversationService {
             }
         }
     }
+
+    public List<Conversation> getLatestConversations(String username, int limit) {
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new CustomException("User not found", HttpStatus.NOT_FOUND));
+
+        List<Conversation> all = conversationRepository.findByUserId(user.getId());
+        if (all.size() <= limit) {
+            return all;
+        }
+        return all.subList(Math.max(0, all.size() - limit), all.size());
+    }
+
     
     /**
      * 管理员查询所有用户的对话历史。

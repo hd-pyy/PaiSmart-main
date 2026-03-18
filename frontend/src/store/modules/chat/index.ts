@@ -2,6 +2,7 @@ import { useWebSocket } from '@vueuse/core';
 
 export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   const conversationId = ref<string>('');
+  const sessions = ref<Array<{ conversationId: string; name: string; createdAt: string }>>([]);
   const input = ref<Api.Chat.Input>({ message: '' });
 
   const list = ref<Api.Chat.Message[]>([]);
@@ -39,6 +40,7 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   return {
     input,
     conversationId,
+    sessions,
     list,
     wsStatus,
     wsData,

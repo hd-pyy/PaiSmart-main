@@ -1,6 +1,6 @@
 <script setup lang="ts">
 const chatStore = useChatStore();
-const { input, list, wsStatus, wsData } = storeToRefs(chatStore);
+const { input, list, wsStatus, wsData, conversationId } = storeToRefs(chatStore);
 
 const latestMessage = computed(() => {
   return list.value[list.value.length - 1] ?? {};
@@ -42,11 +42,24 @@ const handleSend = async () => {
     return;
   }
 
+  if (!conversationId.value) {
+    toast('请先选择或创建会话', { type: 'warning' });
+    return;
+  }
+
   list.value.push({
     content: input.value.message,
     role: 'user'
   });
-  chatStore.wsSend(input.value.message);
+
+  const payload = {
+    type: 'message',
+    conversationId: conversationId.value,
+    content: input.value.message
+  };
+
+  chatStore.wsSend(JSON.stringify(payload));
+
   list.value.push({
     content: '',
     role: 'assistant',

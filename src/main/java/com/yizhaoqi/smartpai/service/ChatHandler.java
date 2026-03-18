@@ -17,6 +17,8 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,6 +45,13 @@ public class ChatHandler {
     private final Map<String, CompletableFuture<String>> responseFutures = new ConcurrentHashMap<>();
     // 停止标志 - 简单方案
     private final Map<String, Boolean> stopFlags = new ConcurrentHashMap<>();
+    // 会话与WebSocket对应关系
+    private final Map<String, String> sessionConversationMap = new ConcurrentHashMap<>();
+
+    // 双层记忆架构参数
+    private static final int SHORT_TERM_MAX_MESSAGES = 20;
+    private static final int SHORT_TERM_MAX_TOKENS = 4000;
+    private static final int LONG_TERM_SUMMARY_LIMIT = 5;
 
     public ChatHandler(RedisTemplate<String, String> redisTemplate,
                       HybridSearchService searchService,
@@ -55,29 +64,39 @@ public class ChatHandler {
         this.objectMapper = new ObjectMapper();
     }
 
-    public void processMessage(String userId, String userMessage, WebSocketSession session) {
+    public void processMessage(String userId, String conversationId, String userMessage, WebSocketSession session) {
         logger.info("开始处理消息，用户ID: {}, 会话ID: {}", userId, session.getId());
         try {
             // 1. 获取或创建会话 ID
-            String conversationId = getOrCreateConversationId(userId);
-            logger.info("会话ID: {}, 用户ID: {}", conversationId, userId);
-            
+            String activeConversationId = getOrCreateConversationId(userId, conversationId);
+            logger.info("会话ID: {}, 用户ID: {}", activeConversationId, userId);
+            sessionConversationMap.put(session.getId(), activeConversationId);
+
             // 为当前会话创建响应构建器
             responseBuilders.put(session.getId(), new StringBuilder());
             // 创建一个CompletableFuture来跟踪响应完成状态
             CompletableFuture<String> responseFuture = new CompletableFuture<>();
             responseFutures.put(session.getId(), responseFuture);
             
-            // 2. 获取对话历史
-            List<Map<String, String>> history = getConversationHistory(conversationId);
-            logger.debug("获取到 {} 条历史对话", history.size());
-            
-            // 3. 执行带权限过滤的混合搜索
+            // 2. 短期记忆：获取当前会话历史并执行滑动窗口剪裁
+            List<Map<String, String>> shortTermHistory = getConversationHistory(activeConversationId);
+            List<Map<String, String>> trimmedHistory = trimShortTermHistory(shortTermHistory, SHORT_TERM_MAX_MESSAGES, SHORT_TERM_MAX_TOKENS);
+            logger.debug("短期记忆长度：{} (原始 {} )", trimmedHistory.size(), shortTermHistory.size());
+
+            // 3. 长期记忆：获取用户历史会话摘要
+            List<Map<String, String>> longTermSummary = getLongTermMemory(userId, LONG_TERM_SUMMARY_LIMIT);
+            logger.debug("长期记忆摘要条数: {}", longTermSummary.size());
+
+            // 4. 执行带权限过滤的混合搜索
             List<SearchResult> searchResults = searchService.searchWithPermission(userMessage, userId, 5);
             logger.debug("搜索结果数量: {}", searchResults.size());
             
-            // 4. 构建上下文
+            // 5. 构建上下文
             String context = buildContext(searchResults);
+            
+            // 6. 创建融合上下文数组，系统+长期+短期
+            List<Map<String, String>> history = new ArrayList<>(longTermSummary);
+            history.addAll(trimmedHistory);
             
             // 5. 调用 DeepSeek API 并处理流式响应
             logger.info("调用DeepSeek API生成回复");
@@ -96,7 +115,7 @@ public class ChatHandler {
                     String completeResponse = responseBuilder != null ? responseBuilder.toString() : "";
 
                     sendCompletionNotification(session);
-                    finalizeConversation(conversationId, userId, userMessage, completeResponse);
+                    finalizeConversation(activeConversationId, userId, userMessage, completeResponse);
 
                     responseBuilders.remove(session.getId());
                     CompletableFuture<String> future = responseFutures.remove(session.getId());
@@ -198,41 +217,53 @@ public class ChatHandler {
 //        }
 //    }
 
-    // 获取会话id
-    private String getOrCreateConversationId(String userId) {
-        String key = "user:" + userId + ":current_conversation";
-        String conversationId = redisTemplate.opsForValue().get(key);
+    private String getOrCreateConversationId(String userId, String requestedConversationId) {
+        String userCurrentKey = "user:" + userId + ":current_conversation";
+        String userSetKey = "user:" + userId + ":conversations";
 
-        if (conversationId == null) {
-            conversationId = UUID.randomUUID().toString();
-            redisTemplate.opsForValue().set(key, conversationId, Duration.ofDays(7));
-            logger.info("为用户 {} 创建新的会话ID: {}", userId, conversationId);
-        } else {
-            logger.info("获取到用户 {} 的现有会话ID: {}", userId, conversationId);
+        if (requestedConversationId != null && !requestedConversationId.isBlank()) {
+            // 优先使用显式请求的会话，如果存在则返回
+            if (Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(userSetKey, requestedConversationId))) {
+                redisTemplate.opsForValue().set(userCurrentKey, requestedConversationId, Duration.ofDays(7));
+                return requestedConversationId;
+            }
         }
 
-        return conversationId;
+        String conversationId = redisTemplate.opsForValue().get(userCurrentKey);
+        if (conversationId != null && !conversationId.isBlank() &&
+                Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(userSetKey, conversationId))) {
+            return conversationId;
+        }
+
+        // 创建新会话
+        String newConversationId = UUID.randomUUID().toString();
+        redisTemplate.opsForSet().add(userSetKey, newConversationId);
+        redisTemplate.opsForValue().set(userCurrentKey, newConversationId, Duration.ofDays(7));
+        redisTemplate.expire(userSetKey, Duration.ofDays(30));
+
+        Map<String, String> meta = new HashMap<>();
+        meta.put("createdAt", LocalDateTime.now().toString());
+        meta.put("name", "会话: " + newConversationId);
+        redisTemplate.opsForHash().putAll("conversation:" + newConversationId + ":meta", meta);
+
+        logger.info("为用户 {} 创建新的会话ID: {}", userId, newConversationId);
+        return newConversationId;
     }
 
-    // 获取对话历史
     private List<Map<String, String>> getConversationHistory(String conversationId) {
         String key = "conversation:" + conversationId + ":messages";
         try {
-            // 从List中获取所有消息，按索引范围（0到-1表示所有）
             List<String> messageJsons = redisTemplate.opsForList().range(key, 0, -1);
-
             if (messageJsons == null || messageJsons.isEmpty()) {
                 logger.debug("会话 {} 没有历史记录", conversationId);
                 return new ArrayList<>();
             }
-
             List<Map<String, String>> history = new ArrayList<>();
             for (String messageJson : messageJsons) {
                 Map<String, String> message = objectMapper.readValue(messageJson,
                         new TypeReference<Map<String, String>>() {});
                 history.add(message);
             }
-
             logger.debug("读取到会话 {} 的 {} 条历史记录", conversationId, history.size());
             return history;
         } catch (JsonProcessingException e) {
@@ -241,65 +272,77 @@ public class ChatHandler {
         }
     }
 
-    // 更新历史记录
     private void updateConversationHistory(String conversationId, String userMessage, String response) {
         String key = "conversation:" + conversationId + ":messages";
-        String metadataKey = "conversation:" + conversationId + ":metadata";
-
-        // 获取当前时间戳
-        String currentTimestamp = java.time.LocalDateTime.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
+        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
 
         try {
-            // 创建用户消息JSON
             Map<String, String> userMsgMap = new LinkedHashMap<>();
             userMsgMap.put("role", "user");
             userMsgMap.put("content", userMessage);
-            userMsgMap.put("timestamp", currentTimestamp);
+            userMsgMap.put("timestamp", now);
             String userMsgJson = objectMapper.writeValueAsString(userMsgMap);
 
-            // 创建助手回复JSON
             Map<String, String> assistantMsgMap = new LinkedHashMap<>();
             assistantMsgMap.put("role", "assistant");
             assistantMsgMap.put("content", response);
-            assistantMsgMap.put("timestamp", currentTimestamp);
+            assistantMsgMap.put("timestamp", now);
             String assistantMsgJson = objectMapper.writeValueAsString(assistantMsgMap);
 
-            // 使用事务保证原子性
-            redisTemplate.execute(new SessionCallback<Object>() {
-                @Override
-                public Object execute(RedisOperations operations) throws DataAccessException {
-                    operations.multi();
+            redisTemplate.opsForList().rightPushAll(key, userMsgJson, assistantMsgJson);
+            redisTemplate.opsForList().trim(key, -SHORT_TERM_MAX_MESSAGES, -1);
+            redisTemplate.expire(key, Duration.ofDays(30));
 
-                    // 向List尾部添加新消息
-                    operations.opsForList().rightPushAll(key, userMsgJson, assistantMsgJson);
-
-                    // 检查并限制List长度（保留最近40条消息，即10轮对话）
-//                    operations.opsForList().trim(key, -40, -1);
-
-                    // 更新会话元数据（最后活动时间）
-                    Map<String, String> metadata = new HashMap<>();
-                    metadata.put("lastActivity", currentTimestamp);
-                    metadata.put("messageCount", String.valueOf(getMessageCount(conversationId) + 2));
-                    try {
-                        String metadataJson = objectMapper.writeValueAsString(metadata);
-                        operations.opsForValue().set(metadataKey, metadataJson, Duration.ofDays(7));
-                    } catch (JsonProcessingException e) {
-                        throw new RuntimeException(e);
-                    }
-
-                    // 设置过期时间
-                    operations.expire(key, Duration.ofDays(7));
-
-                    return operations.exec();
-                }
-            });
-
-            logger.debug("更新会话历史，会话ID: {}, 新增2条消息", conversationId);
-
+            logger.debug("更新短期记忆，会话ID: {}, 新增2条消息", conversationId);
         } catch (JsonProcessingException e) {
-            logger.error("序列化对话历史出错: {}, 会话ID: {}", e.getMessage(), conversationId, e);
+            logger.error("序列化短期历史出错: {}, 会话ID: {}", e.getMessage(), conversationId, e);
         }
+    }
+
+    private List<Map<String, String>> trimShortTermHistory(List<Map<String, String>> history,int maxMessages, int maxTokens) {
+        if (history == null || history.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        int tokenCount = 0;
+        List<Map<String, String>> kept = new ArrayList<>();
+        for (int i = history.size() - 1; i >= 0; i--) {
+            Map<String, String> item = history.get(i);
+            String content = item.getOrDefault("content", "");
+            tokenCount += content.length();
+
+            if (kept.size() >= maxMessages || tokenCount > maxTokens) {
+                break;
+            }
+            kept.add(0, item);
+        }
+
+        // 保证以 human 开始
+        if (!kept.isEmpty() && "assistant".equals(kept.get(0).get("role"))) {
+            kept.remove(0);
+        }
+
+        return kept;
+    }
+
+    private List<Map<String, String>> getLongTermMemory(String userId, int limit) {
+        List<Map<String, String>> result = new ArrayList<>();
+        try {
+            List<com.yizhaoqi.smartpai.model.Conversation> history = conversationService.getLatestConversations(userId, limit);
+            for (com.yizhaoqi.smartpai.model.Conversation item : history) {
+                Map<String, String> question = new LinkedHashMap<>();
+                question.put("role", "user");
+                question.put("content", item.getQuestion());
+                result.add(question);
+                Map<String, String> answer = new LinkedHashMap<>();
+                answer.put("role", "assistant");
+                answer.put("content", item.getAnswer());
+                result.add(answer);
+            }
+        } catch (Exception e) {
+            logger.error("获取长期记忆失败: {}", e.getMessage(), e);
+        }
+        return result;
     }
 
     private void finalizeConversation(String conversationId, String userId, String userMessage, String response) {

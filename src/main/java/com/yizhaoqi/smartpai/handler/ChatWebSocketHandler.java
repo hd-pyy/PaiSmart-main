@@ -65,8 +65,17 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                         return;
                     }
                     
-                    // 其他JSON消息当作普通消息处理
-                    logger.debug("收到JSON格式的聊天消息，当作普通消息处理");
+                    // 其他JSON消息当作聊天指令处理
+                    logger.debug("收到JSON格式的聊天消息，尝试提取conversationId和content");
+                    String type = (String) jsonMessage.get("type");
+                    if ("message".equals(type)) {
+                        String conversationId = (String) jsonMessage.get("conversationId");
+                        String content = (String) jsonMessage.get("content");
+                        if (content != null && !content.isBlank()) {
+                            chatHandler.processMessage(userId, conversationId, content, session);
+                            return;
+                        }
+                    }
                 } catch (Exception jsonParseError) {
                     // JSON解析失败，当作普通文本消息处理
                     logger.debug("JSON解析失败，当作普通消息处理: {}", jsonParseError.getMessage());
@@ -74,7 +83,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             }
             
             // 普通聊天消息处理（保持向下兼容）
-            chatHandler.processMessage(userId, payload, session);
+            chatHandler.processMessage(userId, null, payload, session);
             
         } catch (Exception e) {
             logger.error("处理消息出错，用户ID: {}，会话ID: {}，错误: {}", 
