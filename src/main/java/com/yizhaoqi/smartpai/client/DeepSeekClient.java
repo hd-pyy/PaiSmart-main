@@ -146,12 +146,12 @@ public class DeepSeekClient {
         return messages;
     }
     
-    private void processChunk(String chunk, Consumer<String> onChunk, Runnable onComplete) {
+    private void processChunk(String chunk, Consumer<String> onChunk, Runnable onComplete, java.util.concurrent.atomic.AtomicBoolean completed) {
         try {
             // 检查是否是结束标记
             if ("[DONE]".equals(chunk)) {
                 logger.debug("对话结束标记 [DONE] 接收");
-                if (onComplete != null) {
+                if (onComplete != null && completed.compareAndSet(false, true)) {
                     onComplete.run();
                 }
                 return;

@@ -184,6 +184,41 @@ public class ConversationController {
         }
     }
 
+    @PostMapping("/session/select")
+    public ResponseEntity<?> selectConversationSession(@RequestHeader("Authorization") String token,
+                                                       @RequestBody Map<String, String> body) {
+        String username = null;
+        try {
+            String conversationId = body.get("conversationId");
+            if (conversationId == null || conversationId.isBlank()) {
+                throw new CustomException("conversationId 不能为空", HttpStatus.BAD_REQUEST);
+            }
+
+            username = jwtUtils.extractUsernameFromToken(token.replace("Bearer ", ""));
+            if (username == null || username.isEmpty()) {
+                throw new CustomException("无效的token", HttpStatus.UNAUTHORIZED);
+            }
+
+            User user = userRepository.findByUsername(username)
+                    .orElseThrow(() -> new CustomException("用户不存在", HttpStatus.NOT_FOUND));
+
+            String userSetKey = "user:" + user.getId() + ":conversations";
+            if (!Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(userSetKey, conversationId))) {
+                throw new CustomException("会话ID无效", HttpStatus.BAD_REQUEST);
+            }
+
+            String currentKey = "user:" + user.getId() + ":current_conversation";
+            redisTemplate.opsForValue().set(currentKey, conversationId, Duration.ofDays(7));
+
+            return ResponseEntity.ok(Map.of("code", 200, "message", "切换会话成功", "data", Map.of("conversationId", conversationId)));
+        } catch (CustomException e) {
+            return ResponseEntity.status(e.getStatus()).body(Map.of("code", e.getStatus().value(), "message", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("code", 500, "message", "服务器内部错误: " + e.getMessage()));
+        }
+    }
+
     /**
      * 从Redis获取对话历史
      */
